@@ -6,7 +6,7 @@ Fork of [Dislate Lite](https://github.com/rico040/bunny-plugins/tree/main/plugin
 - Retries on rate limits (429) and server errors
 - DeepL falls back to Google when the free DeepLX proxy is down
 - Error toast shows the actual reason
-- **Auto Translate**: new messages in the open channel that are in another language are translated automatically. Toggle it in plugin settings or from the message long-press menu ("Auto Translate: ON/OFF"). Your own messages, emoji/link-only messages and messages already in your target language are skipped.
+- **Auto Translate**: messages in another language in the open channel are translated automatically — new ones, the latest 50 when a channel is opened, and history as it loads. Translations are remembered and re-applied when Discord reloads a message, without new requests. Toggle it in plugin settings or from the message long-press menu ("Auto Translate: ON/OFF"). Your own messages, emoji/link-only messages and messages already in your target language are skipped.
 
 Install in Revenge: **Plugins → + →** `https://lexa-coder.github.io/dislatefixforme/`
 

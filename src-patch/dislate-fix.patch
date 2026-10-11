@@ -189,22 +189,46 @@ index c827d91..e4db180 100644
 -
 diff --git a/plugins/dislate/src/cache.ts b/plugins/dislate/src/cache.ts
 new file mode 100644
-index 0000000..e46d0d6
+index 0000000..226a5f8
 --- /dev/null
 +++ b/plugins/dislate/src/cache.ts
-@@ -0,0 +1,12 @@
-+// Shared store of original message contents, so a translated message
-+// (manual or automatic) can be reverted from the long-press menu.
+@@ -0,0 +1,36 @@
++// Shared translation state used by manual and automatic translation.
++
++const LIMIT = 3000
++const trim = (m: Map<string, any> | Set<string>) => {
++    while (m.size > LIMIT) {
++        const first = m.keys().next().value
++        m.delete(first)
++    }
++}
++
++// Messages that are currently DISPLAYED translated: id -> original content
 +const originals = new Map<string, string>()
++// Every translation we have made, so it can be re-applied without a new request
++// when Discord re-renders / reloads the message: id -> { original, text, lang }
++const translations = new Map<string, { original: string, text: string, lang: string }>()
++// Messages already in the target language: id -> content (no need to ask again)
++const sameLang = new Map<string, string>()
++// Messages the user manually reverted: auto translate must leave them alone
++const reverted = new Set<string>()
 +
 +export const getOriginal = (id: string) => originals.get(id)
 +export const isTranslated = (id: string) => originals.has(id)
-+export const setOriginal = (id: string, content: string) => {
-+    originals.set(id, content)
-+    // keep memory bounded
-+    if (originals.size > 500) originals.delete(originals.keys().next().value)
-+}
++export const setOriginal = (id: string, content: string) => { originals.set(id, content); trim(originals) }
 +export const clearOriginal = (id: string) => originals.delete(id)
++
++export const getTranslation = (id: string) => translations.get(id)
++export const saveTranslation = (id: string, original: string, text: string, lang: string) => {
++    translations.set(id, { original, text, lang }); trim(translations)
++}
++
++export const isSameLang = (id: string, content: string) => sameLang.get(id) === content
++export const markSameLang = (id: string, content: string) => { sameLang.set(id, content); trim(sameLang) }
++
++export const isReverted = (id: string) => reverted.has(id)
++export const markReverted = (id: string) => { reverted.add(id); trim(reverted) }
++export const unmarkReverted = (id: string) => reverted.delete(id)
 diff --git a/plugins/dislate/src/index.ts b/plugins/dislate/src/index.ts
 index ce27f62..6705988 100644
 --- a/plugins/dislate/src/index.ts
@@ -241,7 +265,7 @@ index ce27f62..6705988 100644
      onUnload: () => { for (const unpatch of patches) unpatch() },
      settings: Settings
 diff --git a/plugins/dislate/src/patches/ActionSheet.tsx b/plugins/dislate/src/patches/ActionSheet.tsx
-index 52890a2..48f7116 100644
+index 52890a2..f776909 100644
 --- a/plugins/dislate/src/patches/ActionSheet.tsx
 +++ b/plugins/dislate/src/patches/ActionSheet.tsx
 @@ -1,5 +1,5 @@
@@ -251,7 +275,7 @@ index 52890a2..48f7116 100644
  import { before, after } from "@vendetta/patcher"
  import { semanticColors } from "@vendetta/ui"
  import { getAssetIDByName } from "@vendetta/ui/assets"
-@@ -7,15 +7,14 @@ import { Forms } from "@vendetta/ui/components"
+@@ -7,15 +7,15 @@ import { Forms } from "@vendetta/ui/components"
  import { findInReactTree } from "@vendetta/utils"
  import { settings } from ".."
  
@@ -260,6 +284,7 @@ index 52890a2..48f7116 100644
  import { logger } from "@vendetta"
 +import { isTranslated as isCached } from "../cache"
 +import { translateContent, showTranslation, revertTranslation } from "../utils"
++import { processChannel } from "./AutoTranslate"
  
  const LazyActionSheet = findByProps("openLazy", "hideActionSheet")
  const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow
@@ -269,7 +294,7 @@ index 52890a2..48f7116 100644
  
  const styles = stylesheet.createThemedStyleSheet({
      iconComponent: {
-@@ -25,7 +24,20 @@ const styles = stylesheet.createThemedStyleSheet({
+@@ -25,7 +25,20 @@ const styles = stylesheet.createThemedStyleSheet({
      }
  })
  
@@ -291,7 +316,7 @@ index 52890a2..48f7116 100644
  
  export default () => before("openLazy", LazyActionSheet, ([component, key, msg]) => {
      const message = msg?.message
-@@ -45,90 +57,45 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+@@ -45,90 +58,46 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
                  message.channel_id,
                  message.id
              )
@@ -401,6 +426,7 @@ index 52890a2..48f7116 100644
 +                () => {
 +                    LazyActionSheet.hideActionSheet()
 +                    settings.auto_translate = !settings.auto_translate
++                    if (settings.auto_translate) processChannel(channelId)
 +                    showToast(
 +                        settings.auto_translate ? "Auto translate enabled" : "Auto translate disabled",
 +                        getAssetIDByName("LanguageIcon")
@@ -413,7 +439,7 @@ index 52890a2..48f7116 100644
  
              // Inject into the first valid ActionSheetRow array inside groups
              if (groups?.length) {
-@@ -138,7 +105,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+@@ -138,7 +107,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
                          (c: any) => Array.isArray(c) && c.some((child: any) => child?.type?.name === "ActionSheetRow")
                      )
                      if (groupChildren) {
@@ -422,7 +448,7 @@ index 52890a2..48f7116 100644
                          return
                      }
                  }
-@@ -147,7 +114,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+@@ -147,7 +116,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
              // Fallback injection if tree searching fails
              const buttons = findInReactTree(component, (x: any) => Array.isArray(x) && x[0]?.type?.name === "ActionSheetRow")
              if (buttons) {
@@ -433,19 +459,23 @@ index 52890a2..48f7116 100644
      }).catch((err: any) => {
 diff --git a/plugins/dislate/src/patches/AutoTranslate.ts b/plugins/dislate/src/patches/AutoTranslate.ts
 new file mode 100644
-index 0000000..c8b6328
+index 0000000..53e1bf1
 --- /dev/null
 +++ b/plugins/dislate/src/patches/AutoTranslate.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,183 @@
 +import { findByStoreName } from "@vendetta/metro"
 +import { FluxDispatcher } from "@vendetta/metro/common"
 +import { logger } from "@vendetta"
 +import { settings } from ".."
-+import { isTranslated } from "../cache"
++import { isTranslated, getTranslation, isSameLang, markSameLang, isReverted, getOriginal, clearOriginal } from "../cache"
 +import { translateContent, showTranslation, sameLanguage } from "../utils"
 +
 +const UserStore = findByStoreName("UserStore")
 +const SelectedChannelStore = findByStoreName("SelectedChannelStore")
++const MessageStore = findByStoreName("MessageStore")
++
++// How many of the latest messages to translate when a channel is opened / history loads
++const HISTORY_LIMIT = 50
 +
 +// Letters of common scripts (Latin, Greek, Cyrillic, Hebrew, Arabic, Indic, Thai, CJK, Hangul).
 +// Plain ranges instead of \p{...} so it works on every Hermes version.
@@ -459,71 +489,187 @@ index 0000000..c8b6328
 +            .replace(/<(a?):\w+:\d+>|<@!?\d+>|<@&\d+>|<#\d+>|:\w+:/g, "")
 +    )
 +
-+// Sequential queue so we don't hammer the translator (avoids 429 errors)
-+const queue: any[] = []
++const currentChannel = () => SelectedChannelStore.getChannelId()
++const myId = () => UserStore.getCurrentUser()?.id
++
++type Item = { id: string, channel_id: string, content: string }
++
++// ---------- request queue (sequential, so Google does not rate-limit us) ----------
++const queue: Item[] = []
++const queued = new Set<string>()
 +let running = false
 +const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 +
 +async function runQueue() {
 +    if (running) return
 +    running = true
-+    while (queue.length) {
-+        const msg = queue.shift()
-+        try {
-+            if (!settings.auto_translate || isTranslated(msg.id)) continue
-+            // Google is used here because it reports the detected language
-+            const { text, source_lang } = await translateContent(msg.content, true)
-+            if (sameLanguage(source_lang, settings.target_lang)) continue
-+            if (!text || text.toLowerCase() === msg.content.trim().toLowerCase()) continue
-+
-+            // Use the configured translator (e.g. DeepL) for the shown text, if not Google
-+            let shown = text
-+            if (settings.translator === 0) {
-+                try { shown = (await translateContent(msg.content)).text || text } catch { }
++    try {
++        while (queue.length) {
++            const msg = queue.shift()!
++            queued.delete(msg.id)
++            // Channel was left - skip, it will be queued again when reopened
++            if (!settings.auto_translate || msg.channel_id !== currentChannel()) continue
++            if (isTranslated(msg.id) || isReverted(msg.id)) continue
++            try {
++                // Google reports the detected language
++                const { text, source_lang } = await translateContent(msg.content, true)
++                if (sameLanguage(source_lang, settings.target_lang)
++                    || !text || text.toLowerCase() === msg.content.trim().toLowerCase()) {
++                    markSameLang(msg.id, msg.content)
++                    continue
++                }
++                let shown = text
++                if (settings.translator === 0) {
++                    try { shown = (await translateContent(msg.content)).text || text } catch (_) { }
++                }
++                if (!isReverted(msg.id)) showTranslation(msg.id, msg.channel_id, msg.content, shown)
++            } catch (e) {
++                logger.error("[Dislate] Auto translate failed:", e)
++                await sleep(1500)
 +            }
-+            showTranslation(msg.id, msg.channel_id, msg.content, shown)
-+        } catch (e) {
-+            logger.error("[Dislate] Auto translate failed:", e)
++            await sleep(200)
 +        }
-+        await sleep(250)
++    } finally {
++        running = false
 +    }
-+    running = false
 +}
 +
-+function onMessageCreate({ message, optimistic }: any) {
-+    try {
-+        if (!settings.auto_translate || optimistic || !message?.content) return
-+        if (message.author?.id && message.author.id === UserStore.getCurrentUser()?.id) return
-+        // Only the channel that is currently open, to keep requests low
-+        if (message.channel_id !== SelectedChannelStore.getChannelId()) return
-+        if (nothingToTranslate(message.content)) return
-+        if (queue.length > 20) queue.shift()
-+        queue.push({ id: message.id, channel_id: message.channel_id, content: message.content })
-+        runQueue()
-+    } catch (e) {
-+        logger.error("[Dislate] Auto translate handler error:", e)
++// ---------- deciding what to do with a message ----------
++const pendingApply: Item[] = []
++let applyScheduled = false
++
++// Re-apply known translations outside of the current Flux dispatch
++function flushApply() {
++    applyScheduled = false
++    const items = pendingApply.splice(0)
++    for (const m of items) {
++        const t = getTranslation(m.id)
++        if (t && !isReverted(m.id)) showTranslation(m.id, m.channel_id, t.original, t.text)
++    }
++}
++
++function consider(raw: any, channelId: string, priority = false) {
++    if (!raw?.id || typeof raw.content !== "string" || !raw.content) return
++    const authorId = raw.author?.id
++    if (authorId && authorId === myId()) return
++    if (isReverted(raw.id)) return
++
++    // Content currently shown is already our translation
++    if (isTranslated(raw.id) && getOriginal(raw.id) !== raw.content) return
++
++    const content = raw.content
++    if (nothingToTranslate(content) || isSameLang(raw.id, content)) return
++
++    const item: Item = { id: raw.id, channel_id: raw.channel_id ?? channelId, content }
++
++    // Already translated before -> just show it again, no request
++    const t = getTranslation(raw.id)
++    if (t && t.original === content && t.lang === settings.target_lang) {
++        pendingApply.push(item)
++        if (!applyScheduled) { applyScheduled = true; setTimeout(flushApply, 0) }
++        return
++    }
++
++    if (queued.has(item.id)) return
++    queued.add(item.id)
++    priority ? queue.unshift(item) : queue.push(item)
++    setTimeout(runQueue, 0)
++}
++
++function messagesOf(channelId: string): any[] {
++    const store = MessageStore.getMessages(channelId)
++    const arr = store?.toArray?.() ?? store?._array ?? []
++    return Array.isArray(arr) ? arr : []
++}
++
++// Translate the latest messages of a channel (newest first)
++export function processChannel(channelId = currentChannel()) {
++    if (!settings.auto_translate || !channelId) return
++    const list = messagesOf(channelId).slice(-HISTORY_LIMIT).reverse()
++    for (const m of list) consider(m, channelId)
++}
++
++// ---------- Flux handlers ----------
++const handlers: Record<string, (a: any) => void> = {
++    MESSAGE_CREATE({ message, optimistic }) {
++        if (!settings.auto_translate || optimistic) return
++        if (message?.channel_id !== currentChannel()) return
++        consider(message, message.channel_id, true)
++    },
++
++    // Edits, embed loading etc. replace the content shown -> translate / re-apply
++    MESSAGE_UPDATE({ message, otherPluginBypass }) {
++        if (!settings.auto_translate || otherPluginBypass) return
++        if (!message?.id || typeof message.content !== "string") return
++        if (message.channel_id && message.channel_id !== currentChannel()) return
++        // Discord replaced our text with the real one
++        if (isTranslated(message.id)) {
++            const t = getTranslation(message.id)
++            if (t && t.original === message.content) {
++                pendingApply.push({ id: message.id, channel_id: message.channel_id, content: message.content })
++                if (!applyScheduled) { applyScheduled = true; setTimeout(flushApply, 0) }
++                return
++            }
++            // The author edited the message -> translate the new text
++            clearOriginal(message.id)
++        }
++        consider(message, message.channel_id, true)
++    },
++
++    // History loaded (opening a channel, scrolling up, reconnect)
++    LOAD_MESSAGES_SUCCESS({ channelId, messages }) {
++        if (!settings.auto_translate || channelId !== currentChannel() || !Array.isArray(messages)) return
++        for (const m of messages.slice(0, HISTORY_LIMIT)) consider(m, channelId)
++    },
++
++    // Switched channel: translate what is already in memory
++    CHANNEL_SELECT({ channelId }) {
++        if (!settings.auto_translate) return
++        setTimeout(() => processChannel(channelId ?? currentChannel()), 300)
++    }
++}
++
++const wrapped: Record<string, (a: any) => void> = {}
++for (const [event, fn] of Object.entries(handlers)) {
++    wrapped[event] = (a: any) => {
++        try { fn(a) } catch (e) { logger.error(`[Dislate] ${event} handler error:`, e) }
 +    }
 +}
 +
 +export default () => {
-+    FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate)
-+    return () => FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate)
++    for (const [event, fn] of Object.entries(wrapped)) FluxDispatcher.subscribe(event, fn)
++    // Plugin (re)loaded with auto translate on -> handle the open channel right away
++    setTimeout(() => processChannel(), 500)
++    return () => {
++        for (const [event, fn] of Object.entries(wrapped)) FluxDispatcher.unsubscribe(event, fn)
++        queue.length = 0
++        queued.clear()
++    }
 +}
 diff --git a/plugins/dislate/src/settings/index.tsx b/plugins/dislate/src/settings/index.tsx
-index ded3d85..5a21610 100644
+index ded3d85..f8578a9 100644
 --- a/plugins/dislate/src/settings/index.tsx
 +++ b/plugins/dislate/src/settings/index.tsx
-@@ -40,6 +40,16 @@ export default () => {
+@@ -8,6 +8,7 @@ import { useProxy } from "@vendetta/storage"
+ import { settings } from ".."
+ import TargetLang from "./TargetLang"
+ import TranslatorPage from "./TranslatorPage"
++import { processChannel } from "../patches/AutoTranslate"
+ 
+ const { ScrollView, Text } = ReactNative
+ const { FormRow, FormSwitchRow } = Forms
+@@ -40,6 +41,17 @@ export default () => {
                  }}
              />
  
 +            <FormSwitchRow
 +                label={"Auto Translate"}
-+                subLabel={"Translate new messages in a different language automatically (open channel only)"}
++                subLabel={"Automatically translate messages in another language in the open channel"}
 +                leading={<FormRow.Icon source={getAssetIDByName("LanguageIcon")} />}
 +                value={settings.auto_translate ?? false}
 +                onValueChange={(v) => {
 +                    settings.auto_translate = v
++                    if (v) processChannel()
 +                }}
 +            />
 +
@@ -532,16 +678,16 @@ index ded3d85..5a21610 100644
                  subLabel={settings.target_lang?.toLowerCase()}
 diff --git a/plugins/dislate/src/utils.ts b/plugins/dislate/src/utils.ts
 new file mode 100644
-index 0000000..cb23511
+index 0000000..16361ff
 --- /dev/null
 +++ b/plugins/dislate/src/utils.ts
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,71 @@
 +import { findByStoreName } from "@vendetta/metro"
 +import { FluxDispatcher } from "@vendetta/metro/common"
 +import { settings } from "."
 +import { DeepL, GTranslate } from "./api"
 +import { toGoogleLang } from "./api/GTranslate"
-+import { setOriginal, getOriginal, clearOriginal } from "./cache"
++import { setOriginal, getOriginal, clearOriginal, saveTranslation, markReverted, unmarkReverted } from "./cache"
 +
 +const ChannelStore = findByStoreName("ChannelStore")
 +const separator = "\n"
@@ -586,6 +732,8 @@ index 0000000..cb23511
 +        ? `${originalContent}${separator}${translated}${tag}`
 +        : `${translated}${tag}`
 +    setOriginal(id, originalContent)
++    saveTranslation(id, originalContent, translated, settings.target_lang ?? "")
++    unmarkReverted(id)
 +    dispatchContent(id, channelId, content)
 +}
 +
@@ -593,6 +741,7 @@ index 0000000..cb23511
 +    const original = getOriginal(id)
 +    if (original === undefined) return
 +    clearOriginal(id)
++    markReverted(id)
 +    dispatchContent(id, channelId, original)
 +}
 +
