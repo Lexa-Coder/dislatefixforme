@@ -187,16 +187,420 @@ index c827d91..e4db180 100644
  export default { translate }
 -
 -
+diff --git a/plugins/dislate/src/cache.ts b/plugins/dislate/src/cache.ts
+new file mode 100644
+index 0000000..e46d0d6
+--- /dev/null
++++ b/plugins/dislate/src/cache.ts
+@@ -0,0 +1,12 @@
++// Shared store of original message contents, so a translated message
++// (manual or automatic) can be reverted from the long-press menu.
++const originals = new Map<string, string>()
++
++export const getOriginal = (id: string) => originals.get(id)
++export const isTranslated = (id: string) => originals.has(id)
++export const setOriginal = (id: string, content: string) => {
++    originals.set(id, content)
++    // keep memory bounded
++    if (originals.size > 500) originals.delete(originals.keys().next().value)
++}
++export const clearOriginal = (id: string) => originals.delete(id)
+diff --git a/plugins/dislate/src/index.ts b/plugins/dislate/src/index.ts
+index ce27f62..6705988 100644
+--- a/plugins/dislate/src/index.ts
++++ b/plugins/dislate/src/index.ts
+@@ -1,6 +1,7 @@
+ import { storage } from "@vendetta/plugin"
+ import patchActionSheet from "./patches/ActionSheet"
+ import patchCommands from "./patches/Commands"
++import patchAutoTranslate from "./patches/AutoTranslate"
+ import Settings from "./settings"
+ 
+ export const settings: {
+@@ -8,18 +9,21 @@ export const settings: {
+     target_lang?: string
+     translator?: number
+     immersive_enabled?: boolean
++    auto_translate?: boolean
+ } = storage
+ 
+ settings.target_lang ??= "en"
+ settings.translator ??= 1
+ settings.immersive_enabled ??= true
++settings.auto_translate ??= false
+ 
+ let patches = []
+ 
+ export default {
+     onLoad: () => patches = [
+         patchActionSheet(),
+-        patchCommands()
++        patchCommands(),
++        patchAutoTranslate()
+     ],
+     onUnload: () => { for (const unpatch of patches) unpatch() },
+     settings: Settings
 diff --git a/plugins/dislate/src/patches/ActionSheet.tsx b/plugins/dislate/src/patches/ActionSheet.tsx
-index 52890a2..ab2e4fe 100644
+index 52890a2..48f7116 100644
 --- a/plugins/dislate/src/patches/ActionSheet.tsx
 +++ b/plugins/dislate/src/patches/ActionSheet.tsx
-@@ -110,7 +110,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
-                         cachedData = cachedData.filter((e: any) => e !== existingCachedObject)
+@@ -1,5 +1,5 @@
+ import { findByProps, findByStoreName } from "@vendetta/metro"
+-import { FluxDispatcher, React, ReactNative, stylesheet } from "@vendetta/metro/common"
++import { React, ReactNative, stylesheet } from "@vendetta/metro/common"
+ import { before, after } from "@vendetta/patcher"
+ import { semanticColors } from "@vendetta/ui"
+ import { getAssetIDByName } from "@vendetta/ui/assets"
+@@ -7,15 +7,14 @@ import { Forms } from "@vendetta/ui/components"
+ import { findInReactTree } from "@vendetta/utils"
+ import { settings } from ".."
+ 
+-import { DeepL, GTranslate } from "../api"
+ import { showToast } from "@vendetta/ui/toasts"
+ import { logger } from "@vendetta"
++import { isTranslated as isCached } from "../cache"
++import { translateContent, showTranslation, revertTranslation } from "../utils"
+ 
+ const LazyActionSheet = findByProps("openLazy", "hideActionSheet")
+ const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow
+ const MessageStore = findByStoreName("MessageStore")
+-const ChannelStore = findByStoreName("ChannelStore")
+-const separator = "\n"
+ 
+ const styles = stylesheet.createThemedStyleSheet({
+     iconComponent: {
+@@ -25,7 +24,20 @@ const styles = stylesheet.createThemedStyleSheet({
+     }
+ })
+ 
+-let cachedData: object[] = []
++const makeRow = (label: string, icon: any, onPress: () => void) => React.createElement(ActionSheetRow, {
++    label,
++    icon: React.createElement(ActionSheetRow.Icon, {
++        source: icon,
++        IconComponent: () => (
++            <ReactNative.Image
++                resizeMode="cover"
++                style={styles.iconComponent}
++                source={icon}
++            />
++        )
++    }),
++    onPress
++})
+ 
+ export default () => before("openLazy", LazyActionSheet, ([component, key, msg]) => {
+     const message = msg?.message
+@@ -45,90 +57,45 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+                 message.channel_id,
+                 message.id
+             )
+-            if (!originalMessage?.content && !message.content) return
+ 
+             const messageId = originalMessage?.id ?? message.id
++            const channelId = originalMessage?.channel_id ?? message.channel_id
+             const messageContent = originalMessage?.content ?? message.content
+-            const existingCachedObject = cachedData.find((o: any) => Object.keys(o)[0] === messageId)
+-
+-            const translateType = existingCachedObject ? "Revert" : "Translate"
+-            const icon = translateType === "Translate" ? getAssetIDByName("LanguageIcon") : getAssetIDByName("ic_highlight")
+-
+-            const translate = async () => {
+-                LazyActionSheet.hideActionSheet()
+-                try {
+-                    const target_lang = settings.target_lang
+-                    const isTranslated = translateType === "Translate"
+-                    const isImmersive = settings.immersive_enabled
+-
+-                    if (!originalMessage) return
+-
+-                    const emojiRegex = /<(a?):\w+:\d+>|<@!?\d+>|<#\d+>/g
+-                    const placeholders: string[] = []
+-                    const textToTranslate = messageContent.replace(emojiRegex, (match: string) => {
+-                        placeholders.push(match)
+-                        return ` [[${placeholders.length - 1}]] `
+-                    })
+-                    
+-                    let translateResult
+-                    switch(settings.translator) {
+-                        case 0:
+-                            translateResult = await DeepL.translate(textToTranslate, undefined, target_lang, !isTranslated)
+-                            break
+-                        case 1:
+-                            translateResult = await GTranslate.translate(textToTranslate, undefined, target_lang, !isTranslated)
+-                            break
++            const alreadyTranslated = isCached(messageId)
++
++            const rows: any[] = []
++
++            if (messageContent || alreadyTranslated) {
++                const translate = async () => {
++                    LazyActionSheet.hideActionSheet()
++                    try {
++                        if (alreadyTranslated) return revertTranslation(messageId, channelId)
++                        const { text } = await translateContent(messageContent)
++                        showTranslation(messageId, channelId, messageContent, text)
++                    } catch (e) {
++                        showToast(`Translate failed: ${String((e as any)?.message ?? e).slice(0, 120)}`, getAssetIDByName("Small"))
++                        logger.error(e)
                      }
-                 } catch (e) {
+-
+-                    let translatedText = translateResult.text
+-                    placeholders.forEach((original, index) => {
+-                        const pRegex = new RegExp(`\\[\\[\\s*${index}\\s*\\]\\]`, 'g')
+-                        translatedText = translatedText.replace(pRegex, original)
+-                    })
+-
+-                    const finalContent = isTranslated
+-                        ? (isImmersive
+-                            ? `${messageContent}${separator}${translatedText.trim()} \`[${target_lang?.toLowerCase()}]\``
+-                            : `${translatedText.trim()} \`[${target_lang?.toLowerCase()}]\``)
+-                        : (existingCachedObject as any)[messageId]
+-
+-                    FluxDispatcher.dispatch({
+-                        type: "MESSAGE_UPDATE",
+-                        message: {
+-                            id: messageId,
+-                            channel_id: originalMessage.channel_id,
+-                            guild_id: ChannelStore.getChannel(originalMessage.channel_id)?.guild_id,
+-                            content: finalContent,
+-                        },
+-                        log_edit: false,
+-                        otherPluginBypass: true
+-                    })
+-
+-                    if (isTranslated) {
+-                        cachedData.unshift({ [messageId]: messageContent })
+-                    } else {
+-                        cachedData = cachedData.filter((e: any) => e !== existingCachedObject)
+-                    }
+-                } catch (e) {
 -                    showToast("Failed to translate message. Please check Debug Logs for more info.", getAssetIDByName("Small"))
-+                    showToast(`Translate failed: ${String((e as any)?.message ?? e).slice(0, 120)}`, getAssetIDByName("Small"))
-                     logger.error(e)
+-                    logger.error(e)
                  }
++                rows.push(makeRow(
++                    alreadyTranslated ? "Revert Message" : "Translate Message",
++                    alreadyTranslated ? getAssetIDByName("ic_highlight") : getAssetIDByName("LanguageIcon"),
++                    translate
++                ))
              }
+ 
+-            const translateRow = React.createElement(ActionSheetRow, {
+-                label: `${translateType} Message`,
+-                icon: React.createElement(ActionSheetRow.Icon, {
+-                    source: icon,
+-                    IconComponent: () => (
+-                        <ReactNative.Image
+-                            resizeMode="cover"
+-                            style={styles.iconComponent}
+-                            source={icon}
+-                        />
++            rows.push(makeRow(
++                settings.auto_translate ? "Auto Translate: ON (tap to turn off)" : "Auto Translate: OFF (tap to turn on)",
++                getAssetIDByName("ic_locale_24px"),
++                () => {
++                    LazyActionSheet.hideActionSheet()
++                    settings.auto_translate = !settings.auto_translate
++                    showToast(
++                        settings.auto_translate ? "Auto translate enabled" : "Auto translate disabled",
++                        getAssetIDByName("LanguageIcon")
+                     )
+-                }),
+-                onPress: translate
+-            })
++                }
++            ))
+ 
+             // Inject into the first valid ActionSheetRow array inside groups
+             if (groups?.length) {
+@@ -138,7 +105,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+                         (c: any) => Array.isArray(c) && c.some((child: any) => child?.type?.name === "ActionSheetRow")
+                     )
+                     if (groupChildren) {
+-                        groupChildren.unshift(translateRow)
++                        groupChildren.unshift(...rows)
+                         return
+                     }
+                 }
+@@ -147,7 +114,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+             // Fallback injection if tree searching fails
+             const buttons = findInReactTree(component, (x: any) => Array.isArray(x) && x[0]?.type?.name === "ActionSheetRow")
+             if (buttons) {
+-                buttons.unshift(translateRow)
++                buttons.unshift(...rows)
+             }
+         })
+     }).catch((err: any) => {
+diff --git a/plugins/dislate/src/patches/AutoTranslate.ts b/plugins/dislate/src/patches/AutoTranslate.ts
+new file mode 100644
+index 0000000..c8b6328
+--- /dev/null
++++ b/plugins/dislate/src/patches/AutoTranslate.ts
+@@ -0,0 +1,72 @@
++import { findByStoreName } from "@vendetta/metro"
++import { FluxDispatcher } from "@vendetta/metro/common"
++import { logger } from "@vendetta"
++import { settings } from ".."
++import { isTranslated } from "../cache"
++import { translateContent, showTranslation, sameLanguage } from "../utils"
++
++const UserStore = findByStoreName("UserStore")
++const SelectedChannelStore = findByStoreName("SelectedChannelStore")
++
++// Letters of common scripts (Latin, Greek, Cyrillic, Hebrew, Arabic, Indic, Thai, CJK, Hangul).
++// Plain ranges instead of \p{...} so it works on every Hermes version.
++const letterRegex = /[A-Za-zÀ-ɏͰ-ϿЀ-ӿ֐-׿؀-ۿऀ-෿฀-๿぀-ヿ㐀-鿿가-힯]/
++
++// Text that has nothing to translate: links, emojis, mentions, numbers, punctuation
++const nothingToTranslate = (s: string) =>
++    !letterRegex.test(
++        s
++            .replace(/https?:\/\/\S+/g, "")
++            .replace(/<(a?):\w+:\d+>|<@!?\d+>|<@&\d+>|<#\d+>|:\w+:/g, "")
++    )
++
++// Sequential queue so we don't hammer the translator (avoids 429 errors)
++const queue: any[] = []
++let running = false
++const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
++
++async function runQueue() {
++    if (running) return
++    running = true
++    while (queue.length) {
++        const msg = queue.shift()
++        try {
++            if (!settings.auto_translate || isTranslated(msg.id)) continue
++            // Google is used here because it reports the detected language
++            const { text, source_lang } = await translateContent(msg.content, true)
++            if (sameLanguage(source_lang, settings.target_lang)) continue
++            if (!text || text.toLowerCase() === msg.content.trim().toLowerCase()) continue
++
++            // Use the configured translator (e.g. DeepL) for the shown text, if not Google
++            let shown = text
++            if (settings.translator === 0) {
++                try { shown = (await translateContent(msg.content)).text || text } catch { }
++            }
++            showTranslation(msg.id, msg.channel_id, msg.content, shown)
++        } catch (e) {
++            logger.error("[Dislate] Auto translate failed:", e)
++        }
++        await sleep(250)
++    }
++    running = false
++}
++
++function onMessageCreate({ message, optimistic }: any) {
++    try {
++        if (!settings.auto_translate || optimistic || !message?.content) return
++        if (message.author?.id && message.author.id === UserStore.getCurrentUser()?.id) return
++        // Only the channel that is currently open, to keep requests low
++        if (message.channel_id !== SelectedChannelStore.getChannelId()) return
++        if (nothingToTranslate(message.content)) return
++        if (queue.length > 20) queue.shift()
++        queue.push({ id: message.id, channel_id: message.channel_id, content: message.content })
++        runQueue()
++    } catch (e) {
++        logger.error("[Dislate] Auto translate handler error:", e)
++    }
++}
++
++export default () => {
++    FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate)
++    return () => FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate)
++}
+diff --git a/plugins/dislate/src/settings/index.tsx b/plugins/dislate/src/settings/index.tsx
+index ded3d85..5a21610 100644
+--- a/plugins/dislate/src/settings/index.tsx
++++ b/plugins/dislate/src/settings/index.tsx
+@@ -40,6 +40,16 @@ export default () => {
+                 }}
+             />
+ 
++            <FormSwitchRow
++                label={"Auto Translate"}
++                subLabel={"Translate new messages in a different language automatically (open channel only)"}
++                leading={<FormRow.Icon source={getAssetIDByName("LanguageIcon")} />}
++                value={settings.auto_translate ?? false}
++                onValueChange={(v) => {
++                    settings.auto_translate = v
++                }}
++            />
++
+             <FormRow
+                 label={"Translate to"}
+                 subLabel={settings.target_lang?.toLowerCase()}
+diff --git a/plugins/dislate/src/utils.ts b/plugins/dislate/src/utils.ts
+new file mode 100644
+index 0000000..cb23511
+--- /dev/null
++++ b/plugins/dislate/src/utils.ts
+@@ -0,0 +1,68 @@
++import { findByStoreName } from "@vendetta/metro"
++import { FluxDispatcher } from "@vendetta/metro/common"
++import { settings } from "."
++import { DeepL, GTranslate } from "./api"
++import { toGoogleLang } from "./api/GTranslate"
++import { setOriginal, getOriginal, clearOriginal } from "./cache"
++
++const ChannelStore = findByStoreName("ChannelStore")
++const separator = "\n"
++
++// Protect custom emojis, mentions and channel links from being mangled
++const tokenRegex = /<(a?):\w+:\d+>|<@!?\d+>|<@&\d+>|<#\d+>/g
++
++export async function translateContent(content: string, forceGoogle = false) {
++    const placeholders: string[] = []
++    const textToTranslate = content.replace(tokenRegex, (match: string) => {
++        placeholders.push(match)
++        return ` [[${placeholders.length - 1}]] `
++    })
++
++    const result = (!forceGoogle && settings.translator === 0)
++        ? await DeepL.translate(textToTranslate, undefined, settings.target_lang)
++        : await GTranslate.translate(textToTranslate, undefined, settings.target_lang)
++
++    let text = result.text
++    placeholders.forEach((original, index) => {
++        text = text.replace(new RegExp(`\\[\\[\\s*${index}\\s*\\]\\]`, "g"), original)
++    })
++    return { text: text.replace(/ {2,}/g, " ").trim(), source_lang: result.source_lang as string }
++}
++
++const dispatchContent = (id: string, channelId: string, content: string) =>
++    FluxDispatcher.dispatch({
++        type: "MESSAGE_UPDATE",
++        message: {
++            id,
++            channel_id: channelId,
++            guild_id: ChannelStore.getChannel(channelId)?.guild_id,
++            content
++        },
++        log_edit: false,
++        otherPluginBypass: true
++    })
++
++export function showTranslation(id: string, channelId: string, originalContent: string, translated: string) {
++    const tag = ` \`[${settings.target_lang?.toLowerCase()}]\``
++    const content = settings.immersive_enabled
++        ? `${originalContent}${separator}${translated}${tag}`
++        : `${translated}${tag}`
++    setOriginal(id, originalContent)
++    dispatchContent(id, channelId, content)
++}
++
++export function revertTranslation(id: string, channelId: string) {
++    const original = getOriginal(id)
++    if (original === undefined) return
++    clearOriginal(id)
++    dispatchContent(id, channelId, original)
++}
++
++// "ru" == "RU" == "ru-RU" ; "zh-CN" vs "zh-TW" are treated as different
++export const sameLanguage = (a?: string, b?: string) => {
++    if (!a || !b) return false
++    const ga = toGoogleLang(a).toLowerCase(), gb = toGoogleLang(b).toLowerCase()
++    if (ga === gb) return true
++    if (ga.startsWith("zh") || gb.startsWith("zh")) return false
++    return ga.split("-")[0] === gb.split("-")[0]
++}
