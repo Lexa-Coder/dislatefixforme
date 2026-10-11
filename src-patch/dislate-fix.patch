@@ -230,7 +230,7 @@ index 0000000..226a5f8
 +export const markReverted = (id: string) => { reverted.add(id); trim(reverted) }
 +export const unmarkReverted = (id: string) => reverted.delete(id)
 diff --git a/plugins/dislate/src/index.ts b/plugins/dislate/src/index.ts
-index ce27f62..6705988 100644
+index ce27f62..1ea02c0 100644
 --- a/plugins/dislate/src/index.ts
 +++ b/plugins/dislate/src/index.ts
 @@ -1,6 +1,7 @@
@@ -241,17 +241,19 @@ index ce27f62..6705988 100644
  import Settings from "./settings"
  
  export const settings: {
-@@ -8,18 +9,21 @@ export const settings: {
+@@ -8,18 +9,23 @@ export const settings: {
      target_lang?: string
      translator?: number
      immersive_enabled?: boolean
 +    auto_translate?: boolean
++    auto_translate_own?: boolean
  } = storage
  
  settings.target_lang ??= "en"
  settings.translator ??= 1
  settings.immersive_enabled ??= true
 +settings.auto_translate ??= false
++settings.auto_translate_own ??= false
  
  let patches = []
  
@@ -265,7 +267,7 @@ index ce27f62..6705988 100644
      onUnload: () => { for (const unpatch of patches) unpatch() },
      settings: Settings
 diff --git a/plugins/dislate/src/patches/ActionSheet.tsx b/plugins/dislate/src/patches/ActionSheet.tsx
-index 52890a2..f776909 100644
+index 52890a2..de81cbe 100644
 --- a/plugins/dislate/src/patches/ActionSheet.tsx
 +++ b/plugins/dislate/src/patches/ActionSheet.tsx
 @@ -1,5 +1,5 @@
@@ -316,7 +318,7 @@ index 52890a2..f776909 100644
  
  export default () => before("openLazy", LazyActionSheet, ([component, key, msg]) => {
      const message = msg?.message
-@@ -45,90 +58,46 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+@@ -45,90 +58,45 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
                  message.channel_id,
                  message.id
              )
@@ -354,21 +356,7 @@ index 52890a2..f776909 100644
 -                        case 1:
 -                            translateResult = await GTranslate.translate(textToTranslate, undefined, target_lang, !isTranslated)
 -                            break
-+            const alreadyTranslated = isCached(messageId)
-+
-+            const rows: any[] = []
-+
-+            if (messageContent || alreadyTranslated) {
-+                const translate = async () => {
-+                    LazyActionSheet.hideActionSheet()
-+                    try {
-+                        if (alreadyTranslated) return revertTranslation(messageId, channelId)
-+                        const { text } = await translateContent(messageContent)
-+                        showTranslation(messageId, channelId, messageContent, text)
-+                    } catch (e) {
-+                        showToast(`Translate failed: ${String((e as any)?.message ?? e).slice(0, 120)}`, getAssetIDByName("Small"))
-+                        logger.error(e)
-                     }
+-                    }
 -
 -                    let translatedText = translateResult.text
 -                    placeholders.forEach((original, index) => {
@@ -398,7 +386,21 @@ index 52890a2..f776909 100644
 -                        cachedData.unshift({ [messageId]: messageContent })
 -                    } else {
 -                        cachedData = cachedData.filter((e: any) => e !== existingCachedObject)
--                    }
++            const alreadyTranslated = isCached(messageId)
++
++            const rows: any[] = []
++
++            if (messageContent || alreadyTranslated) {
++                const translate = async () => {
++                    LazyActionSheet.hideActionSheet()
++                    try {
++                        if (alreadyTranslated) return revertTranslation(messageId, channelId)
++                        const { text } = await translateContent(messageContent)
++                        showTranslation(messageId, channelId, messageContent, text)
++                    } catch (e) {
++                        showToast(`Translate failed: ${String((e as any)?.message ?? e).slice(0, 120)}`, getAssetIDByName("Small"))
++                        logger.error(e)
+                     }
 -                } catch (e) {
 -                    showToast("Failed to translate message. Please check Debug Logs for more info.", getAssetIDByName("Small"))
 -                    logger.error(e)
@@ -420,26 +422,26 @@ index 52890a2..f776909 100644
 -                            style={styles.iconComponent}
 -                            source={icon}
 -                        />
-+            rows.push(makeRow(
-+                settings.auto_translate ? "Auto Translate: ON (tap to turn off)" : "Auto Translate: OFF (tap to turn on)",
-+                getAssetIDByName("ic_locale_24px"),
-+                () => {
-+                    LazyActionSheet.hideActionSheet()
-+                    settings.auto_translate = !settings.auto_translate
-+                    if (settings.auto_translate) processChannel(channelId)
-+                    showToast(
-+                        settings.auto_translate ? "Auto translate enabled" : "Auto translate disabled",
-+                        getAssetIDByName("LanguageIcon")
-                     )
+-                    )
 -                }),
 -                onPress: translate
 -            })
++            const toggleRow = (key: "auto_translate" | "auto_translate_own", name: string) => rows.push(makeRow(
++                `${name}: ${settings[key] ? "ON" : "OFF"}`,
++                getAssetIDByName(key === "auto_translate" ? "ic_locale_24px" : "ic_edit_24px"),
++                () => {
++                    LazyActionSheet.hideActionSheet()
++                    settings[key] = !settings[key]
++                    if (settings[key]) processChannel(channelId)
++                    showToast(`${name}: ${settings[key] ? "enabled" : "disabled"}`, getAssetIDByName("LanguageIcon"))
 +                }
 +            ))
++            toggleRow("auto_translate", "Auto Translate Others")
++            toggleRow("auto_translate_own", "Auto Translate My Messages")
  
              // Inject into the first valid ActionSheetRow array inside groups
              if (groups?.length) {
-@@ -138,7 +107,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+@@ -138,7 +106,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
                          (c: any) => Array.isArray(c) && c.some((child: any) => child?.type?.name === "ActionSheetRow")
                      )
                      if (groupChildren) {
@@ -448,7 +450,7 @@ index 52890a2..f776909 100644
                          return
                      }
                  }
-@@ -147,7 +116,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+@@ -147,7 +115,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
              // Fallback injection if tree searching fails
              const buttons = findInReactTree(component, (x: any) => Array.isArray(x) && x[0]?.type?.name === "ActionSheetRow")
              if (buttons) {
@@ -459,10 +461,10 @@ index 52890a2..f776909 100644
      }).catch((err: any) => {
 diff --git a/plugins/dislate/src/patches/AutoTranslate.ts b/plugins/dislate/src/patches/AutoTranslate.ts
 new file mode 100644
-index 0000000..53e1bf1
+index 0000000..ad0feb1
 --- /dev/null
 +++ b/plugins/dislate/src/patches/AutoTranslate.ts
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,188 @@
 +import { findByStoreName } from "@vendetta/metro"
 +import { FluxDispatcher } from "@vendetta/metro/common"
 +import { logger } from "@vendetta"
@@ -492,7 +494,12 @@ index 0000000..53e1bf1
 +const currentChannel = () => SelectedChannelStore.getChannelId()
 +const myId = () => UserStore.getCurrentUser()?.id
 +
-+type Item = { id: string, channel_id: string, content: string }
++// Two independent switches: messages of other people / your own messages
++const anyAuto = () => !!(settings.auto_translate || settings.auto_translate_own)
++const wantsAuthor = (authorId?: string) =>
++    authorId && authorId === myId() ? !!settings.auto_translate_own : !!settings.auto_translate
++
++type Item = { id: string, channel_id: string, content: string, author_id?: string }
 +
 +// ---------- request queue (sequential, so Google does not rate-limit us) ----------
 +const queue: Item[] = []
@@ -508,7 +515,7 @@ index 0000000..53e1bf1
 +            const msg = queue.shift()!
 +            queued.delete(msg.id)
 +            // Channel was left - skip, it will be queued again when reopened
-+            if (!settings.auto_translate || msg.channel_id !== currentChannel()) continue
++            if (!wantsAuthor(msg.author_id) || msg.channel_id !== currentChannel()) continue
 +            if (isTranslated(msg.id) || isReverted(msg.id)) continue
 +            try {
 +                // Google reports the detected language
@@ -550,8 +557,8 @@ index 0000000..53e1bf1
 +
 +function consider(raw: any, channelId: string, priority = false) {
 +    if (!raw?.id || typeof raw.content !== "string" || !raw.content) return
-+    const authorId = raw.author?.id
-+    if (authorId && authorId === myId()) return
++    const authorId = raw.author?.id ?? MessageStore.getMessage(raw.channel_id ?? channelId, raw.id)?.author?.id
++    if (!wantsAuthor(authorId)) return
 +    if (isReverted(raw.id)) return
 +
 +    // Content currently shown is already our translation
@@ -560,7 +567,7 @@ index 0000000..53e1bf1
 +    const content = raw.content
 +    if (nothingToTranslate(content) || isSameLang(raw.id, content)) return
 +
-+    const item: Item = { id: raw.id, channel_id: raw.channel_id ?? channelId, content }
++    const item: Item = { id: raw.id, channel_id: raw.channel_id ?? channelId, content, author_id: authorId }
 +
 +    // Already translated before -> just show it again, no request
 +    const t = getTranslation(raw.id)
@@ -584,7 +591,7 @@ index 0000000..53e1bf1
 +
 +// Translate the latest messages of a channel (newest first)
 +export function processChannel(channelId = currentChannel()) {
-+    if (!settings.auto_translate || !channelId) return
++    if (!anyAuto() || !channelId) return
 +    const list = messagesOf(channelId).slice(-HISTORY_LIMIT).reverse()
 +    for (const m of list) consider(m, channelId)
 +}
@@ -592,14 +599,14 @@ index 0000000..53e1bf1
 +// ---------- Flux handlers ----------
 +const handlers: Record<string, (a: any) => void> = {
 +    MESSAGE_CREATE({ message, optimistic }) {
-+        if (!settings.auto_translate || optimistic) return
++        if (!anyAuto() || optimistic) return
 +        if (message?.channel_id !== currentChannel()) return
 +        consider(message, message.channel_id, true)
 +    },
 +
 +    // Edits, embed loading etc. replace the content shown -> translate / re-apply
 +    MESSAGE_UPDATE({ message, otherPluginBypass }) {
-+        if (!settings.auto_translate || otherPluginBypass) return
++        if (!anyAuto() || otherPluginBypass) return
 +        if (!message?.id || typeof message.content !== "string") return
 +        if (message.channel_id && message.channel_id !== currentChannel()) return
 +        // Discord replaced our text with the real one
@@ -618,13 +625,13 @@ index 0000000..53e1bf1
 +
 +    // History loaded (opening a channel, scrolling up, reconnect)
 +    LOAD_MESSAGES_SUCCESS({ channelId, messages }) {
-+        if (!settings.auto_translate || channelId !== currentChannel() || !Array.isArray(messages)) return
++        if (!anyAuto() || channelId !== currentChannel() || !Array.isArray(messages)) return
 +        for (const m of messages.slice(0, HISTORY_LIMIT)) consider(m, channelId)
 +    },
 +
 +    // Switched channel: translate what is already in memory
 +    CHANNEL_SELECT({ channelId }) {
-+        if (!settings.auto_translate) return
++        if (!anyAuto()) return
 +        setTimeout(() => processChannel(channelId ?? currentChannel()), 300)
 +    }
 +}
@@ -647,7 +654,7 @@ index 0000000..53e1bf1
 +    }
 +}
 diff --git a/plugins/dislate/src/settings/index.tsx b/plugins/dislate/src/settings/index.tsx
-index ded3d85..f8578a9 100644
+index ded3d85..6440f04 100644
 --- a/plugins/dislate/src/settings/index.tsx
 +++ b/plugins/dislate/src/settings/index.tsx
 @@ -8,6 +8,7 @@ import { useProxy } from "@vendetta/storage"
@@ -658,17 +665,28 @@ index ded3d85..f8578a9 100644
  
  const { ScrollView, Text } = ReactNative
  const { FormRow, FormSwitchRow } = Forms
-@@ -40,6 +41,17 @@ export default () => {
+@@ -40,6 +41,28 @@ export default () => {
                  }}
              />
  
 +            <FormSwitchRow
-+                label={"Auto Translate"}
-+                subLabel={"Automatically translate messages in another language in the open channel"}
++                label={"Auto Translate Others"}
++                subLabel={"Automatically translate other people's messages in another language"}
 +                leading={<FormRow.Icon source={getAssetIDByName("LanguageIcon")} />}
 +                value={settings.auto_translate ?? false}
 +                onValueChange={(v) => {
 +                    settings.auto_translate = v
++                    if (v) processChannel()
++                }}
++            />
++
++            <FormSwitchRow
++                label={"Auto Translate My Messages"}
++                subLabel={"Also translate your own messages written in another language"}
++                leading={<FormRow.Icon source={getAssetIDByName("ic_edit_24px")} />}
++                value={settings.auto_translate_own ?? false}
++                onValueChange={(v) => {
++                    settings.auto_translate_own = v
 +                    if (v) processChannel()
 +                }}
 +            />
