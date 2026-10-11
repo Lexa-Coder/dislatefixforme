@@ -1,0 +1,202 @@
+diff --git a/plugins/dislate/src/api/DeepL.ts b/plugins/dislate/src/api/DeepL.ts
+index 62d038f..29cb0a4 100644
+--- a/plugins/dislate/src/api/DeepL.ts
++++ b/plugins/dislate/src/api/DeepL.ts
+@@ -1,29 +1,36 @@
+ import { DeepLResponse } from "../type"
++import GTranslate from "./GTranslate"
+ 
+-// TODO: Change API link when it'll be down
++// Free public DeepLX proxy - often down or rate limited.
++// Like Vencord, we fall back to Google Translate when it fails.
+ const API_URL = "https://deeplx.1stg.me/translate"
+ 
++const deeplOnly = async (text: string, source_lang: string, target_lang: string) => {
++    const res = await fetch(API_URL, {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ text, source_lang, target_lang })
++    })
++    if (!res.ok) throw Error(`DeepL: ${res.status} ${res.statusText}`)
++    const data: DeepLResponse = await res.json()
++    if (data?.code !== 200 || typeof data.data !== "string")
++        throw Error(`DeepL: ${data?.message ?? "unexpected response"}`)
++    return { source_lang, text: data.data }
++}
++
+ const translate = async (text: string, source_lang: string = "auto", target_lang: string, original: boolean = false) => {
++    if (original) return { source_lang, text }
++    if (!text?.trim()) return { source_lang, text }
++
+     try {
+-        if (original) return { source_lang, text }
+-        const data: DeepLResponse = await (await fetch(API_URL, {
+-            method: "POST",
+-            headers: {
+-                "Content-Type": "application/json"
+-            },
+-            body: JSON.stringify({
+-                text,
+-                source_lang,
+-                target_lang
+-            })
+-        })).json()
+-        if (data.code !== 200) throw Error(`Failed to translate text from DeepL: ${data.message}`)
+-        return { source_lang, text: data.data }
++        return await deeplOnly(text, source_lang, target_lang)
+     } catch (e) {
+-        throw Error(`Failed to fetch from DeepL: ${e}`)
++        try {
++            return await GTranslate.translate(text, source_lang, target_lang)
++        } catch (e2) {
++            throw Error(`Failed to fetch from DeepL: ${e} | Google fallback: ${e2}`)
++        }
+     }
+ }
+ 
+ export default { translate }
+-
+-
+diff --git a/plugins/dislate/src/api/GTranslate.ts b/plugins/dislate/src/api/GTranslate.ts
+index c827d91..1e63e47 100644
+--- a/plugins/dislate/src/api/GTranslate.ts
++++ b/plugins/dislate/src/api/GTranslate.ts
+@@ -1,30 +1,102 @@
+-// "inspired" by https://github.com/Vendicated/Vencord/blob/main/src/plugins/translate/utils.ts
+-import { GTranslateResponse } from "../type"
++// Translation logic ported from Vencord's Translate plugin:
++// https://github.com/Vendicated/Vencord/blob/main/src/plugins/translate/utils.ts
++// Primary: translate-pa.googleapis.com (the endpoint Vencord uses, much more stable).
++// Fallback: the old translate.googleapis.com/translate_a/single endpoint.
++// Each endpoint is retried on rate limits / server errors.
++
++const VENCORD_KEY = "AIzaSyDLEeFI5OtFBwYBIoK_jj5m32rZK5CkCXA"
++
++const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
++
++// DeepL-style codes ("RU", "EN-US", "ZH", "PT-BR") -> Google codes ("ru", "en", "zh-CN", "pt")
++export const toGoogleLang = (lang?: string): string => {
++    if (!lang || lang.toLowerCase() === "auto") return "auto"
++    const up = lang.toUpperCase()
++    if (up === "ZH" || up === "ZH-HANS") return "zh-CN"
++    if (up === "ZH-HANT") return "zh-TW"
++    if (up === "NB") return "no"
++    // already a Google code with region (e.g. "zh-CN") - keep as is
++    if (lang !== up && lang.includes("-")) return lang
++    return lang.split("-")[0].toLowerCase()
++}
++
++class HttpError extends Error {
++    status: number
++    constructor(status: number, message: string) {
++        super(message)
++        this.status = status
++    }
++}
++
++const retryable = (e: any) =>
++    !(e instanceof HttpError) || e.status === 429 || e.status >= 500
++
++async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
++    let lastErr: any
++    for (let i = 0; i < attempts; i++) {
++        try {
++            return await fn()
++        } catch (e) {
++            lastErr = e
++            if (!retryable(e) || i === attempts - 1) break
++            await sleep(600 * (i + 1))
++        }
++    }
++    throw lastErr
++}
++
++async function translatePa(text: string, sl: string, tl: string) {
++    const url = "https://translate-pa.googleapis.com/v1/translate?" + new URLSearchParams({
++        "params.client": "gtx",
++        "dataTypes": "TRANSLATION",
++        "key": VENCORD_KEY,
++        "query.sourceLanguage": sl,
++        "query.targetLanguage": tl,
++        "query.text": text
++    })
++    const res = await fetch(url)
++    if (!res.ok) throw new HttpError(res.status, `translate-pa: ${res.status} ${res.statusText}`)
++    const data = await res.json()
++    if (typeof data?.translation !== "string") throw new Error("translate-pa: unexpected response")
++    return { source_lang: data.sourceLanguage ?? sl, text: data.translation as string }
++}
++
++async function translateLegacy(text: string, sl: string, tl: string) {
++    const url = "https://translate.googleapis.com/translate_a/single?" + new URLSearchParams({
++        client: "gtx",
++        sl,
++        tl,
++        dt: "t",
++        dj: "1",
++        source: "input",
++        q: text
++    })
++    const res = await fetch(url)
++    if (!res.ok) throw new HttpError(res.status, `translate_a: ${res.status} ${res.statusText}`)
++    const data = await res.json()
++    if (!Array.isArray(data?.sentences)) throw new Error("translate_a: unexpected response")
++    return {
++        source_lang: data.src ?? sl,
++        text: data.sentences.map((s: any) => s?.trans ?? "").join("")
++    }
++}
+ 
+ const translate = async (text: string, source_lang: string = "auto", target_lang: string, original: boolean = false) => {
++    if (original) return { source_lang, text }
++    if (!text?.trim()) return { source_lang, text }
++
++    const sl = toGoogleLang(source_lang)
++    const tl = toGoogleLang(target_lang)
++
+     try {
+-        if (original) return { source_lang, text }
+-
+-        const API_URL = "https://translate.googleapis.com/translate_a/single?" + new URLSearchParams({
+-            client: "gtx",
+-            sl: source_lang,
+-            tl: target_lang,
+-            dt: "t",
+-            dj: "1",
+-            source: "input",
+-            q: text
+-        });
+-
+-        const data: GTranslateResponse = await (await fetch(API_URL)).json()
+-
+-        return { 
+-            source_lang, 
+-            text: data.sentences.map(s => s.trans).join('') }
+-    } catch (e) {
+-        throw Error(`Failed to fetch from Google Translate: ${e}`)
++        return await withRetry(() => translatePa(text, sl, tl))
++    } catch (e1) {
++        try {
++            return await withRetry(() => translateLegacy(text, sl, tl), 2)
++        } catch (e2) {
++            throw Error(`Failed to fetch from Google Translate: ${e1} | fallback: ${e2}`)
++        }
+     }
+ }
+ 
+ export default { translate }
+-
+-
+diff --git a/plugins/dislate/src/patches/ActionSheet.tsx b/plugins/dislate/src/patches/ActionSheet.tsx
+index 52890a2..ab2e4fe 100644
+--- a/plugins/dislate/src/patches/ActionSheet.tsx
++++ b/plugins/dislate/src/patches/ActionSheet.tsx
+@@ -110,7 +110,7 @@ export default () => before("openLazy", LazyActionSheet, ([component, key, msg])
+                         cachedData = cachedData.filter((e: any) => e !== existingCachedObject)
+                     }
+                 } catch (e) {
+-                    showToast("Failed to translate message. Please check Debug Logs for more info.", getAssetIDByName("Small"))
++                    showToast(`Translate failed: ${String((e as any)?.message ?? e).slice(0, 120)}`, getAssetIDByName("Small"))
+                     logger.error(e)
+                 }
+             }
